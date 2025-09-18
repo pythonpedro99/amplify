@@ -5,7 +5,7 @@ Jeremy A. Collins, Loránd Cheng, Kunal Aneja, Albert Wilcox, Benjamin Joffe, An
 [![Website](https://img.shields.io/badge/Website-amplify--robotics.github.io-0a84ff?logo=google-chrome&logoColor=white&style=flat)](https://amplify-robotics.github.io/)
 [![arXiv](https://img.shields.io/badge/arXiv-2506.14198-b31b1b.svg?logo=arXiv&logoColor=white&style=flat)](https://arxiv.org/abs/2506.14198)
 [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white&style=flat)](https://www.python.org)
-[![License](https://img.shields.io/github/license/pairlab/AMPLIFY?style=flat)](LICENSE)
+![license](https://img.shields.io/github/license/pairlab/AMPLIFY?style=flat&cacheSeconds=1)
 [![lucidrains/amplify-pytorch](https://img.shields.io/badge/lucidrains%2Famplify--pytorch-181717?logo=github&logoColor=white&style=flat)](https://github.com/lucidrains/amplify-pytorch)
 
 This repo contains the official implementation of AMPLIFY: Actionless Motion Priors for Robot Learning from Videos.
