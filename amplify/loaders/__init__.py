@@ -1,1 +1,2 @@
 from .libero_dataset import LiberoDataset
+from .rearrange_dataset import RearrangeDataset
