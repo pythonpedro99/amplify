@@ -12,7 +12,7 @@ from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
 from tqdm import tqdm
 
 import wandb
-from amplify.loaders import LiberoDataset
+from amplify.loaders import LiberoDataset, RearrangeDataset
 
 
 def seed_everything(seed):
@@ -255,19 +255,47 @@ def get_datasets(
         "aug_cfg": aug_cfg,
     }
 
+    rearrange_cfg = getattr(motion_tokenizer_cfg, "rearrange_dataset", None)
+    if rearrange_cfg is not None:
+        rearrange_cfg = OmegaConf.to_container(rearrange_cfg, resolve=True, throw_on_missing=True)
+
     # Train datasets
     train_dataset_info = parse_dataset_strings(train_datasets)
     print("train_dataset_info: ", train_dataset_info)
 
     train_datasets = {}
     for dataset_name, modality_dict in train_dataset_info:
-        for modality in modality_dict:
+        for modality, subset_frac in modality_dict.items():
+            dataset_keys = list(keys_to_load)
+            if modality == "action":
+                dataset_keys = [k for k in dataset_keys if k not in ["tracks", "traj"]]
+                if "actions" not in dataset_keys:
+                    dataset_keys.append("actions")
+                if "images" not in dataset_keys:
+                    dataset_keys.append("images")
+
             if "libero" in str(dataset_name):
+                dataset_kwargs = dict(common_cfgs)
+                dataset_kwargs["keys_to_load"] = dataset_keys
                 dataset = LiberoDataset(
                     dataset_names=[dataset_name],
-                    demo_subset=modality_dict[modality],
+                    demo_subset=subset_frac,
                     libero_path=motion_tokenizer_cfg.libero_path,
-                    **common_cfgs,
+                    **dataset_kwargs,
+                )
+            elif str(dataset_name).startswith("rearrange"):
+                if rearrange_cfg is None:
+                    raise ValueError("rearrange_dataset configuration must be set to use rearrange datasets")
+                dataset = RearrangeDataset(
+                    root_dir=root_dir,
+                    dataset_name=str(dataset_name),
+                    split="train",
+                    keys_to_load=dataset_keys,
+                    img_shape=motion_tokenizer_cfg.img_shape,
+                    true_horizon=motion_tokenizer_cfg.true_horizon,
+                    cfg=rearrange_cfg,
+                    fraction=subset_frac,
+                    aug_cfg=aug_cfg,
                 )
             else:
                 raise NotImplementedError(f"Dataset {dataset_name} is not implemented.")
@@ -284,13 +312,37 @@ def get_datasets(
 
         val_datasets = {}
         for dataset_name, modality_dict in val_dataset_info:
-            for modality in modality_dict:
+            for modality, subset_frac in modality_dict.items():
+                dataset_keys = list(keys_to_load)
+                if modality == "action":
+                    dataset_keys = [k for k in dataset_keys if k not in ["tracks", "traj"]]
+                    if "actions" not in dataset_keys:
+                        dataset_keys.append("actions")
+                    if "images" not in dataset_keys:
+                        dataset_keys.append("images")
+
                 if "libero" in str(dataset_name):
+                    dataset_kwargs = dict(common_cfgs)
+                    dataset_kwargs["keys_to_load"] = dataset_keys
                     dataset = LiberoDataset(
                         dataset_names=[dataset_name],
-                        demo_subset=modality_dict[modality],
+                        demo_subset=subset_frac,
                         libero_path=motion_tokenizer_cfg.libero_path,
-                        **common_cfgs,
+                        **dataset_kwargs,
+                    )
+                elif str(dataset_name).startswith("rearrange"):
+                    if rearrange_cfg is None:
+                        raise ValueError("rearrange_dataset configuration must be set to use rearrange datasets")
+                    dataset = RearrangeDataset(
+                        root_dir=root_dir,
+                        dataset_name=str(dataset_name),
+                        split="val",
+                        keys_to_load=dataset_keys,
+                        img_shape=motion_tokenizer_cfg.img_shape,
+                        true_horizon=motion_tokenizer_cfg.true_horizon,
+                        cfg=rearrange_cfg,
+                        fraction=subset_frac,
+                        aug_cfg=aug_cfg,
                     )
                 else:
                     raise NotImplementedError(f"Validation dataset {dataset_name} is not implemented.")
