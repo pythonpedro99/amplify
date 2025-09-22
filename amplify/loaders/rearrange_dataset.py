@@ -180,6 +180,7 @@ class RearrangeDataset(BaseDataset):
         }
 
         self._obs_cache: Dict[int, np.ndarray] = {}
+        self.track_keys = [k for k in keys_to_load if k in {"tracks", "vis"}]
 
         super().__init__(
             root_dir=root_dir,
@@ -195,6 +196,17 @@ class RearrangeDataset(BaseDataset):
             use_cached_index_map=bool(self.cfg.get("use_cached_index_map", False)),
             aug_cfg=aug_cfg,
         )
+        self.track_keys = [k for k in self.keys_to_load if k in {"tracks", "vis"}]
+
+        self.track_keys = [k for k in self.keys_to_load if k in {"tracks", "vis"}]
+        self.image_obs_keys = ["images"]
+        if self.obs_paths:
+            sample_obs = np.load(self.obs_paths[0], mmap_mode="r")
+            self.data_img_size = tuple(int(x) for x in sample_obs.shape[1:3])
+            del sample_obs
+        else:
+            self.data_img_size = self.img_shape
+        self.resize_transform = Resize(self.img_shape, antialias=False)
 
         self.track_keys = [k for k in self.keys_to_load if k in {"tracks", "vis"}]
         self.image_obs_keys = ["images"]
