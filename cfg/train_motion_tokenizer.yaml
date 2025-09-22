@@ -1,6 +1,6 @@
 # Train
-batch_size: 256 # batch size, will accumulate gradients if greater than gpu_max_bs
-gpu_max_bs: 64 # max batch size for gpu
+batch_size: 32 # batch size, will accumulate gradients if greater than gpu_max_bs
+gpu_max_bs: 32 # max batch size for gpu
 num_epochs: 100
 lr: 1e-4
 lr_schedule: null # cosine, null
@@ -14,7 +14,7 @@ compile: false
 root_dir: null
 train_split: 1.0
 log_interval: 500 # steps
-save_interval: 25 # epochs
+save_interval: 1 # epochs
 checkpoint: null
 resume: true # if no checkpoint is provided, resume from the latest checkpoint in the run directory (make sure run name is correct!)
 run_name: default_run_name
@@ -37,6 +37,7 @@ task_names: null
 
 rearrange_dataset:
   data_path: null
+  preprocessed_dir: null
   n_rollout: null
   split_ratio: 0.9
   normalize_action: false
@@ -59,12 +60,12 @@ cond_cameraviews:
 keys_to_load:
   - tracks
   - images
-img_shape: [128, 128]
-true_horizon: 16
-track_pred_horizon: 16
+img_shape: [224, 224]
+true_horizon: 4
+track_pred_horizon: 4
 interp_method: linear # linear, spline
-num_tracks: 400
-num_workers: 4
+num_tracks: 200
+num_workers: 16
 
 # Model
 type: transformer

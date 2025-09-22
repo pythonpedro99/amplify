@@ -1,0 +1,14 @@
+mode: tracks
+
+source_dir: /content/rearrange_200_v1
+dest_dir: preprocessed_data
+dataset_name: rearrange
+view_name: agentview
+skip_exist: true
+n_rollout: null
+
+n_tracks: 400
+init_queries: uniform
+reinit: true
+horizon: 16
+batch_size: 8
