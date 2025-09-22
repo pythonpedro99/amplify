@@ -438,7 +438,10 @@ class RearrangeDataset(BaseDataset):
         else:
             raise ValueError(f"Unsupported track file format: {track_path.suffix}")
 
-        return loader(track_path, frames, offsets, start_t)
+        loaded = loader(track_path, frames, offsets, start_t)
+        if isinstance(loaded, dict) and track_path is not None:
+            loaded.setdefault("_track_path", str(track_path))
+        return loaded
 
     def _slice_hdf5_dataset(
         self,
@@ -613,9 +616,24 @@ class RearrangeDataset(BaseDataset):
             data["actions"] = actions
 
         if "tracks" in data:
+            track_path = data.pop("_track_path", None)
             tracks = data["tracks"].astype(np.float32)
+            track_count = tracks.shape[-2] if tracks.ndim >= 2 else None
             if tracks.ndim != 4:
                 raise ValueError(f"Expected tracks to have 4 dimensions, got {tracks.shape}")
+            if track_count is not None and track_count != self.num_tracks:
+                context_parts = [
+                    f"dataset='{self.dataset_name}'",
+                    f"split='{self.split}'",
+                    f"track_method='{self.track_method}'",
+                ]
+                if track_path:
+                    context_parts.append(f"track_path='{track_path}'")
+                context = ", ".join(context_parts)
+                raise ValueError(
+                    "Track count mismatch: "
+                    f"expected {self.num_tracks} tracks but got {track_count} ({context})"
+                )
 
             vis = data.get("vis")
             if vis is not None:
