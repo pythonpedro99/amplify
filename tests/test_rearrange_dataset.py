@@ -54,6 +54,7 @@ def test_rearrange_dataset_loads_tracks(tmp_path):
         "num_pred": 1,
         "frameskip": 1,
         "track_method": "uniform_400_reinit_16",
+        "n_tracks": 2,
     }
 
     dataset = RearrangeDataset(
@@ -89,3 +90,39 @@ def test_rearrange_dataset_loads_tracks(tmp_path):
     assert "traj" in sample_with_vis
     assert "vis" in sample_with_vis
     assert sample_with_vis["vis"].shape[:3] == sample_with_vis["traj"].shape[:3]
+
+
+def test_rearrange_dataset_errors_on_track_count_mismatch(tmp_path):
+    _build_dummy_rearrange_dataset(tmp_path)
+
+    cfg = {
+        "data_path": "rearrange_data",
+        "preprocessed_dir": "preprocessed/rearrange_test",
+        "num_hist": 3,
+        "num_pred": 1,
+        "frameskip": 1,
+        "track_method": "uniform_400_reinit_16",
+        "n_tracks": 3,
+    }
+
+    dataset = RearrangeDataset(
+        root_dir=str(tmp_path),
+        dataset_name="rearrange_test",
+        split="train",
+        keys_to_load=["tracks", "images"],
+        img_shape=[32, 32],
+        true_horizon=4,
+        cfg=dict(cfg),
+        fraction=1.0,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        dataset[0]
+
+    message = str(exc_info.value)
+    assert "expected 3 tracks" in message
+    assert "got 2" in message
+    assert "dataset='rearrange_test'" in message
+    assert "split='train'" in message
+    assert "track_method='uniform_400_reinit_16'" in message
+    assert "track_path='" in message
