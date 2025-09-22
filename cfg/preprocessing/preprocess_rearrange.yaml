@@ -1,6 +1,6 @@
 mode: tracks
 
-source_dir: rearrange_dataset
+source_dir: /content/rearrange_200_v1
 dest_dir: preprocessed_data
 dataset_name: rearrange
 view_name: agentview
