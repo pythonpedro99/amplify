@@ -2,9 +2,10 @@ import json
 import math
 import os
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 import h5py
 import numpy as np
@@ -14,11 +15,15 @@ from omegaconf import DictConfig, OmegaConf
 from torchvision.transforms import Resize
 
 from amplify.loaders.base_dataset import BaseDataset
-from amplify.utils.data_utils import (
-    interpolate_traj,
-    interpolate_traj_spline,
-    normalize_traj,
-)
+from amplify.utils.data_utils import normalize_traj
+
+try:  # pragma: no cover - optional dependency
+    import h5py
+except ImportError:  # pragma: no cover - optional dependency
+    h5py = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover
+    import h5py as _h5py
 
 
 @dataclass
@@ -48,6 +53,8 @@ class RearrangeDataset(BaseDataset):
             cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         self.cfg = cfg or {}
 
+        self.track_keys = [k for k in keys_to_load if k in ["tracks", "vis"]]
+
         self.dataset_name = dataset_name
         self.split = split if split in {"train", "val", "valid"} else "train"
         self.img_shape = tuple(int(x) for x in img_shape)
@@ -61,39 +68,11 @@ class RearrangeDataset(BaseDataset):
             raise ValueError("Slice length must be positive")
         self.slice_span = self.frameskip * (self.slice_len - 1) + 1
 
-        view_names = self.cfg.get("view_names")
-        if view_names is not None:
-            self.view_names = tuple(str(v) for v in view_names)
-        else:
-            self.view_names = (str(self.cfg.get("view_name", "agentview")),)
-        self.primary_view = self.view_names[0]
-
-        track_method_cfg = self.cfg.get("track_method")
-        if track_method_cfg is None:
-            reinit_suffix = ""
-            if self.cfg.get("reinit", True):
-                reinit_suffix = f"_reinit_{int(self.cfg.get('horizon', 16))}"
-            track_method_cfg = (
-                f"{self.cfg.get('init_queries', 'uniform')}"
-                f"_{int(self.cfg.get('n_tracks', 400))}{reinit_suffix}"
-            )
-        self.track_method = str(track_method_cfg)
-
-        preprocessed_dir = self.cfg.get("preprocessed_dir", "preprocessed_data")
-        preprocessed_dir = os.path.expanduser(str(preprocessed_dir))
-        if not os.path.isabs(preprocessed_dir):
-            preprocessed_dir = os.path.join(root_dir, preprocessed_dir)
-        self.preprocessed_dir = Path(preprocessed_dir)
-
-        tracks_dir = self.cfg.get("tracks_dir")
-        if tracks_dir is None:
-            tracks_dir = self.preprocessed_dir / self.dataset_name / self.track_method
-        else:
-            tracks_dir = Path(os.path.expanduser(str(tracks_dir)))
-            if not tracks_dir.is_absolute():
-                tracks_dir = Path(root_dir) / tracks_dir
-        self.track_root = Path(tracks_dir)
-        self.track_file_template = str(self.cfg.get("track_file_template", "ep_{episode:04d}.hdf5"))
+        track_method = str(self.cfg.get("track_method", "uniform_400_reinit_16"))
+        cameras_cfg = self.cfg.get("cond_cameraviews")
+        if cameras_cfg is None:
+            cameras_cfg = ["agentview"]
+        self._configured_cameras = tuple(cameras_cfg)
 
         data_path = self.cfg.get("data_path")
         if data_path is None:
@@ -104,6 +83,23 @@ class RearrangeDataset(BaseDataset):
         self.data_path = Path(data_path)
         if not self.data_path.exists():
             raise FileNotFoundError(f"Rearrange dataset path does not exist: {self.data_path}")
+
+        preprocessed_dir_cfg = self.cfg.get("preprocessed_dir")
+        self.preprocessed_dir: Optional[Path] = None
+        if preprocessed_dir_cfg is not None:
+            preprocessed_dir = Path(os.path.expanduser(str(preprocessed_dir_cfg)))
+            if not preprocessed_dir.is_absolute():
+                preprocessed_dir = Path(root_dir) / preprocessed_dir
+            self.preprocessed_dir = preprocessed_dir
+        if self.track_keys:
+            if self.preprocessed_dir is None:
+                raise ValueError(
+                    "rearrange_dataset.preprocessed_dir must be set when requesting tracks"
+                )
+            if not self.preprocessed_dir.exists():
+                raise FileNotFoundError(
+                    f"Preprocessed track directory not found: {self.preprocessed_dir}"
+                )
 
         metadata_path = self.data_path / "metadata.json"
         if not metadata_path.exists():
@@ -135,6 +131,12 @@ class RearrangeDataset(BaseDataset):
 
         action_example = self.actions[0]
         self.action_dim = int(action_example.shape[-1] if action_example.ndim > 1 else 1)
+
+        if self.obs_paths:
+            obs_arr = np.load(self.obs_paths[0], mmap_mode="r")
+            self.data_img_size = tuple(int(x) for x in obs_arr.shape[1:3])
+        else:
+            self.data_img_size = self.img_shape
 
         self.normalize_action = bool(self.cfg.get("normalize_action", False))
         if self.normalize_action:
@@ -180,13 +182,15 @@ class RearrangeDataset(BaseDataset):
         }
 
         self._obs_cache: Dict[int, np.ndarray] = {}
-        self.track_keys = [k for k in keys_to_load if k in {"tracks", "vis"}]
+        self._track_file_cache: Dict[int, Path] = {}
+        self._track_index_built = False
+        self._track_dir_candidates: Optional[List[Path]] = None
 
         super().__init__(
             root_dir=root_dir,
             dataset_names=[dataset_name],
-            track_method=self.track_method,
-            cond_cameraviews=list(self.view_names),
+            track_method=track_method,
+            cond_cameraviews=self._configured_cameras,
             keys_to_load=list(keys_to_load),
             img_shape=self.img_shape,
             true_horizon=int(true_horizon),
@@ -196,18 +200,7 @@ class RearrangeDataset(BaseDataset):
             use_cached_index_map=bool(self.cfg.get("use_cached_index_map", False)),
             aug_cfg=aug_cfg,
         )
-        self.track_keys = [k for k in self.keys_to_load if k in {"tracks", "vis"}]
-
-        self.track_keys = [k for k in self.keys_to_load if k in {"tracks", "vis"}]
-        self.image_obs_keys = ["images"]
-        if self.obs_paths:
-            sample_obs = np.load(self.obs_paths[0], mmap_mode="r")
-            self.data_img_size = tuple(int(x) for x in sample_obs.shape[1:3])
-            del sample_obs
-        else:
-            self.data_img_size = self.img_shape
-        self.resize_transform = Resize(self.img_shape, antialias=False)
-
+        
         self.track_keys = [k for k in self.keys_to_load if k in {"tracks", "vis"}]
         self.image_obs_keys = ["images"]
         if self.obs_paths:
@@ -217,6 +210,10 @@ class RearrangeDataset(BaseDataset):
         else:
             self.data_img_size = self.img_shape
         self.resize_transform = Resize(self.img_shape, antialias=False)
+
+
+
+        self.track_keys = [k for k in self.keys_to_load if k in ["tracks", "vis"]]
 
     # ------------------------------------------------------------------
     # BaseDataset abstract implementations
@@ -236,25 +233,16 @@ class RearrangeDataset(BaseDataset):
 
     def create_index_map(self) -> List[Dict]:
         index_map: List[Dict] = []
-        need_tracks = bool(self.track_keys)
         missing_tracks = 0
-
         for epi_idx in self.selected_indices:
             seq_len = self.seq_lengths[epi_idx]
             if seq_len < self.slice_span:
                 continue
 
             track_path: Optional[Path] = None
-            if need_tracks:
-                episode_id = int(self.episodes_meta[epi_idx]["episode"])
-                track_fname = self.track_file_template.format(
-                    episode=episode_id,
-                    episode_idx=epi_idx,
-                    split=self.split,
-                    dataset=self.dataset_name,
-                )
-                track_path = self.track_root / track_fname
-                if not track_path.exists():
+            if self.track_keys:
+                track_path = self._find_track_path(epi_idx)
+                if track_path is None:
                     missing_tracks += 1
                     continue
 
@@ -278,12 +266,133 @@ class RearrangeDataset(BaseDataset):
                 raise ValueError("n_slices must be provided when filtering is enabled")
             index_map = self._filter_entries(index_map, filter_cfg.n_slices, filter_cfg.seed)
 
-        if need_tracks and missing_tracks > 0:
+        if self.track_keys and missing_tracks:
             print(
-                f"[RearrangeDataset] Skipped {missing_tracks} episodes without preprocessed tracks"
+                f"[RearrangeDataset] Skipped {missing_tracks} episode(s) without preprocessed tracks"
             )
 
         return index_map
+
+    def _get_track_dir_candidates(self) -> List[Path]:
+        if self.preprocessed_dir is None:
+            return []
+        if not hasattr(self, "_track_dir_candidates") or self._track_dir_candidates is None:
+            candidates: List[Path] = []
+            seen: set = set()
+
+            dataset_dir = self.dataset_name if self.dataset_name else None
+            data_path_name = self.data_path.name if self.data_path.name else None
+            track_method = getattr(self, "track_method", None)
+            split = self.split if self.split else None
+
+            segments: List[Iterable[Optional[str]]] = [
+                (dataset_dir, track_method, split),
+                (data_path_name, track_method, split),
+                (dataset_dir, split, track_method),
+                (data_path_name, split, track_method),
+                (track_method, split),
+                (dataset_dir, track_method),
+                (data_path_name, track_method),
+                (track_method,),
+                (dataset_dir, split),
+                (data_path_name, split),
+                (split,),
+                (dataset_dir,),
+                (data_path_name,),
+                tuple(),
+            ]
+
+            for parts in segments:
+                parts = tuple(p for p in parts if p)
+                path = self.preprocessed_dir.joinpath(*parts) if parts else self.preprocessed_dir
+                if path in seen:
+                    continue
+                seen.add(path)
+                if path.exists():
+                    candidates.append(path)
+
+            self._track_dir_candidates = candidates
+        return list(self._track_dir_candidates)
+
+    def _extract_episode_basenames(self, epi_idx: int) -> List[str]:
+        meta = self.episodes_meta[epi_idx] if epi_idx < len(self.episodes_meta) else {}
+        base_names: List[str] = []
+
+        for key in [
+            "track_file",
+            "track_path",
+            "episode_name",
+            "file",
+            "path",
+        ]:
+            value = meta.get(key)
+            if isinstance(value, str) and value:
+                base_names.append(Path(value).stem)
+
+        ep_id = int(meta.get("episode", epi_idx))
+        base_names.append(f"ep_{ep_id:04d}")
+        base_names.append(str(ep_id))
+
+        unique: List[str] = []
+        seen = set()
+        for name in base_names:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        return unique
+
+    def _build_track_index(self) -> None:
+        if self.preprocessed_dir is None or self._track_index_built:
+            return
+        self._track_index_built = True
+
+        priority_cache: Dict[int, tuple[int, Path]] = {}
+        for ext in (".hdf5", ".h5", ".npz"):
+            for path in self.preprocessed_dir.rglob(f"*{ext}"):
+                if not path.is_file():
+                    continue
+                track_method = getattr(self, "track_method", None)
+                if track_method and track_method not in path.parts:
+                    continue
+                match = re.search(r"ep[_-]?(\d+)", path.stem)
+                if not match:
+                    continue
+                ep_id = int(match.group(1))
+                priority = 0 if self.split and self.split in path.parts else 1
+                existing = priority_cache.get(ep_id)
+                if existing is None or priority < existing[0]:
+                    priority_cache[ep_id] = (priority, path)
+
+        for ep_id, (_, path) in priority_cache.items():
+            self._track_file_cache.setdefault(ep_id, path)
+
+    def _find_track_path(self, epi_idx: int) -> Optional[Path]:
+        if self.preprocessed_dir is None:
+            return None
+
+        meta = self.episodes_meta[epi_idx] if epi_idx < len(self.episodes_meta) else {}
+        ep_id = int(meta.get("episode", epi_idx))
+        cached = self._track_file_cache.get(ep_id)
+        if cached is not None and cached.exists():
+            return cached
+        elif cached is not None and not cached.exists():
+            del self._track_file_cache[ep_id]
+
+        base_names = self._extract_episode_basenames(epi_idx)
+        candidates = self._get_track_dir_candidates()
+        for name in base_names:
+            for directory in candidates:
+                for ext in (".hdf5", ".h5", ".npz"):
+                    candidate = directory / f"{name}{ext}"
+                    if candidate.exists():
+                        self._track_file_cache[ep_id] = candidate
+                        return candidate
+
+        self._build_track_index()
+        cached = self._track_file_cache.get(ep_id)
+        if cached is not None and cached.exists():
+            return cached
+        return None
 
     def load_images(self, idx_dict: Dict) -> Dict:
         episode_idx = idx_dict["episode_idx"]
@@ -306,34 +415,178 @@ class RearrangeDataset(BaseDataset):
         return {}
 
     def load_tracks(self, idx_dict: Dict) -> Dict:
-        if not self.track_keys:
-            return {}
-        track_path = idx_dict.get("track_path")
-        if track_path is None or not os.path.exists(track_path):
+        track_path_str = idx_dict.get("track_path")
+        if not track_path_str:
             return {}
 
-        start_t = idx_dict["start_t"]
-        tracks_per_view: List[np.ndarray] = []
-        vis_per_view: List[np.ndarray] = []
+        track_path = Path(track_path_str)
+        if not track_path.exists():
+            raise FileNotFoundError(f"Track file not found: {track_path}")
 
-        with h5py.File(track_path, "r") as f:
-            for view in self.view_names:
-                group_name = f"root/{view}"
-                if group_name not in f:
-                    continue
-                view_group = f[group_name]
-                if "tracks" in view_group and "tracks" in self.track_keys:
-                    tracks_per_view.append(view_group["tracks"][start_t:start_t + 1])
-                if "vis" in view_group and "vis" in self.track_keys:
-                    vis_per_view.append(view_group["vis"][start_t:start_t + 1])
-                elif "visibility" in view_group and "vis" in self.track_keys:
-                    vis_per_view.append(view_group["visibility"][start_t:start_t + 1])
+        frames: List[int] = idx_dict["frames"]
+        if not frames:
+            return {}
+        start_t = frames[0]
+        offsets = [f - start_t for f in frames]
+        if any(offset < 0 for offset in offsets):
+            raise ValueError(f"Invalid frame offsets computed from frames={frames}")
 
+        if track_path.suffix.lower() in {".h5", ".hdf5"}:
+            loader = self._load_tracks_from_hdf5
+        elif track_path.suffix.lower() == ".npz":
+            loader = self._load_tracks_from_npz
+        else:
+            raise ValueError(f"Unsupported track file format: {track_path.suffix}")
+
+        return loader(track_path, frames, offsets, start_t)
+
+    def _slice_hdf5_dataset(
+        self,
+        dset: Any,
+        frames: List[int],
+        offsets: List[int],
+        start_t: int,
+        track_path: Path,
+        key: str,
+    ) -> np.ndarray:
+        if self.reinit and dset.ndim >= 3:
+            if start_t >= dset.shape[0]:
+                raise IndexError(
+                    f"start_t {start_t} out of bounds for {key} in {track_path} with shape {dset.shape}"
+                )
+            data = np.asarray(dset[start_t])
+            if offsets:
+                max_offset = max(offsets)
+                if max_offset >= data.shape[0]:
+                    raise IndexError(
+                        f"Offset {max_offset} exceeds horizon {data.shape[0]} for {key} in {track_path}"
+                    )
+                data = data[offsets]
+        else:
+            max_frame = max(frames)
+            if max_frame >= dset.shape[0]:
+                raise IndexError(
+                    f"Frame {max_frame} exceeds sequence length {dset.shape[0]} for {key} in {track_path}"
+                )
+            data = np.asarray(dset[frames])
+        return data.astype(np.float32)
+
+    def _load_tracks_from_hdf5(
+        self,
+        track_path: Path,
+        frames: List[int],
+        offsets: List[int],
+        start_t: int,
+    ) -> Dict[str, np.ndarray]:
+        if h5py is None:
+            raise ImportError(
+                "h5py is required to read preprocessed tracks saved as .hdf5 files. "
+                "Please install h5py to enable track loading."
+            )
         out: Dict[str, np.ndarray] = {}
-        if tracks_per_view:
-            out["tracks"] = np.concatenate(tracks_per_view, axis=0).astype(np.float32)
-        if vis_per_view:
-            out["vis"] = np.concatenate(vis_per_view, axis=0).astype(np.float32)
+        with h5py.File(track_path, "r") as f:
+            root = f["root"] if "root" in f else f
+            for key in self.track_keys:
+                per_view: List[np.ndarray] = []
+                for camera in self.cond_cameraviews:
+                    if camera not in root:
+                        raise KeyError(f"Camera '{camera}' not found in track file {track_path}")
+                    cam_group = root[camera]
+                    if key not in cam_group:
+                        if key == "tracks":
+                            raise KeyError(
+                                f"Track dataset missing '{key}' for camera '{camera}' in {track_path}"
+                            )
+                        else:
+                            continue
+                    dset = cam_group[key]
+                    data = self._slice_hdf5_dataset(dset, frames, offsets, start_t, track_path, key)
+                    per_view.append(data)
+                if per_view:
+                    out[key] = np.stack(per_view, axis=0).astype(np.float32)
+        return out
+
+    def _slice_npz_array(
+        self,
+        arr: np.ndarray,
+        frames: List[int],
+        offsets: List[int],
+        start_t: int,
+        track_path: Path,
+        key: str,
+    ) -> np.ndarray:
+        arr = np.asarray(arr)
+        num_views = len(self.cond_cameraviews)
+
+        if arr.ndim == 5:
+            # (V, T, horizon, N, D)
+            if arr.shape[0] != num_views:
+                raise ValueError(
+                    f"Expected first dim to match number of views ({num_views}) for {key} in {track_path}, got {arr.shape}"
+                )
+            if self.reinit:
+                data = arr[:, start_t]
+                data = data[:, offsets]
+            else:
+                data = arr[:, frames]
+            return data.astype(np.float32)
+
+        if arr.ndim == 4:
+            if arr.shape[0] == num_views:
+                # (V, T, N, D) or (V, T, horizon, N)
+                if self.reinit and arr.shape[2] >= len(offsets):
+                    data = arr[:, start_t]
+                    data = data[:, offsets]
+                else:
+                    data = arr[:, frames]
+                return data.astype(np.float32)
+            else:
+                if self.reinit:
+                    data = arr[start_t]
+                    data = data[offsets]
+                else:
+                    data = arr[frames]
+                return np.expand_dims(data, axis=0).astype(np.float32)
+
+        if arr.ndim == 3:
+            if arr.shape[0] == num_views:
+                if self.reinit:
+                    data = arr[:, start_t]
+                    data = data[:, offsets]
+                else:
+                    data = arr[:, frames]
+                return data.astype(np.float32)
+            else:
+                if self.reinit:
+                    data = arr[start_t]
+                    data = data[offsets]
+                else:
+                    data = arr[frames]
+                return np.expand_dims(data, axis=0).astype(np.float32)
+
+        raise ValueError(
+            f"Unsupported array shape {arr.shape} for key '{key}' in npz track file {track_path}"
+        )
+
+    def _load_tracks_from_npz(
+        self,
+        track_path: Path,
+        frames: List[int],
+        offsets: List[int],
+        start_t: int,
+    ) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        with np.load(track_path, allow_pickle=False) as data:
+            for key in self.track_keys:
+                if key not in data:
+                    if key == "tracks":
+                        raise KeyError(
+                            f"Track file {track_path} is missing required dataset '{key}'"
+                        )
+                    continue
+                arr = data[key]
+                sliced = self._slice_npz_array(arr, frames, offsets, start_t, track_path, key)
+                out[key] = sliced.astype(np.float32)
         return out
 
     def load_text(self, idx_dict: Dict) -> Dict:
@@ -361,38 +614,43 @@ class RearrangeDataset(BaseDataset):
 
         if "tracks" in data:
             tracks = data["tracks"].astype(np.float32)
-            if tracks.shape[1] > self.true_horizon:
-                tracks = tracks[:, : self.true_horizon]
+            if tracks.ndim != 4:
+                raise ValueError(f"Expected tracks to have 4 dimensions, got {tracks.shape}")
+
+            vis = data.get("vis")
+            if vis is not None:
+                vis = vis.astype(np.float32)
+                if vis.ndim == 3:
+                    vis = np.expand_dims(vis, axis=-1)
+                elif vis.ndim != 4:
+                    raise ValueError(f"Unexpected vis shape {vis.shape}")
+                # Align time dimension before padding/truncating
+                if vis.shape[1] != tracks.shape[1]:
+                    min_len = min(vis.shape[1], tracks.shape[1])
+                    tracks = tracks[:, :min_len]
+                    vis = vis[:, :min_len]
+
             tracks = tracks[..., [1, 0]]
             tracks = np.nan_to_num(tracks, nan=0.0, posinf=0.0, neginf=0.0)
             tracks = normalize_traj(tracks, self.data_img_size)
 
-            if self.track_pred_horizon != self.true_horizon:
-                if self.interp_method == "linear":
-                    tracks = interpolate_traj(tracks, self.track_pred_horizon)
-                elif self.interp_method == "spline":
-                    tracks = interpolate_traj_spline(tracks, self.track_pred_horizon)
-                else:
-                    raise NotImplementedError(f"Unknown interpolation method {self.interp_method}")
-                if isinstance(tracks, torch.Tensor):
-                    tracks = tracks.cpu().numpy()
+            target_horizon = int(self.true_horizon)
+            current_horizon = tracks.shape[1]
+            if current_horizon < target_horizon:
+                pad = target_horizon - current_horizon
+                pad_cfg = ((0, 0), (0, pad), (0, 0), (0, 0))
+                tracks = np.pad(tracks, pad_cfg)
+                if vis is not None:
+                    vis = np.pad(vis, ((0, 0), (0, pad), (0, 0), (0, 0)))
+            elif current_horizon > target_horizon:
+                tracks = tracks[:, :target_horizon]
+                if vis is not None:
+                    vis = vis[:, :target_horizon]
 
-            if isinstance(tracks, torch.Tensor):
-                tracks = tracks.cpu().numpy()
-            data["tracks"] = tracks
-
-        if "vis" in data:
-            vis = data["vis"].astype(np.float32)
-            if vis.ndim == 3:
-                vis = np.expand_dims(vis, axis=-1)
-            vis = np.nan_to_num(vis, nan=0.0, posinf=0.0, neginf=0.0)
-            if self.track_pred_horizon != self.true_horizon:
-                vis = interpolate_traj(vis, self.track_pred_horizon)
-                if isinstance(vis, torch.Tensor):
-                    vis = vis.cpu().numpy()
-            if isinstance(vis, torch.Tensor):
-                vis = vis.cpu().numpy()
-            data["vis"] = vis
+            data["tracks"] = tracks.astype(np.float32)
+            if vis is not None:
+                vis = np.nan_to_num(vis, nan=0.0, posinf=0.0, neginf=0.0)
+                data["vis"] = vis.astype(np.float32)
 
         if "tracks" in data:
             data["traj"] = data.pop("tracks")
